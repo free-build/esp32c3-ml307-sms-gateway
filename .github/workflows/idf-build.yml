@@ -1,0 +1,42 @@
+name: Build native ESP-IDF firmware
+
+on:
+  push:
+    paths:
+      - 'main/**'
+      - 'components/**'
+      - 'tests/**'
+      - 'CMakeLists.txt'
+      - 'sdkconfig.defaults'
+      - 'partitions.csv'
+      - '.github/workflows/idf-build.yml'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: bash tests/host/run.sh
+
+  idf-build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.5.2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: idf.py set-target esp32c3
+      - run: idf.py build
+      - run: idf.py size
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sms-forwarding-esp32c3-idf-v5.5.2
+          path: |
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/sms_forwarding_idf.bin
+            build/flash_args

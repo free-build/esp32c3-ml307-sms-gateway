@@ -1,0 +1,7 @@
+code/wifi_config.h
+
+# ESP-IDF generated files、设备备份；公开发布镜像位于 firmware/latest/
+build/
+sdkconfig
+sdkconfig.old
+backups/

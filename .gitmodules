@@ -1,0 +1,3 @@
+[submodule "components/pdulib/upstream"]
+	path = components/pdulib/upstream
+	url = https://github.com/mgaman/PDUlib.git

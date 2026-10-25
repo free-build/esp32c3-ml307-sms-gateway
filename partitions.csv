@@ -1,0 +1,8 @@
+# Preserve the Arduino huge_app offsets so the legacy NVS remains recoverable.
+# Name,        Type, SubType, Offset,   Size,     Flags
+nvs,           data, nvs,     0x9000,   0x5000,
+otadata,       data, ota,     0xe000,   0x2000,
+factory,       app,  factory, 0x10000,  0x280000,
+sms_data,      data, spiffs,  0x290000, 0x80000,
+legacy_data,   data, spiffs,  0x310000, 0xE0000,
+coredump,      data, coredump,0x3F0000, 0x10000,
