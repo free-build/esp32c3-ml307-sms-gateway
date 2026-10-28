@@ -7,17 +7,28 @@
 /** 规范化 AT 指令时使用的最大缓冲区长度。 */
 #define SAFETY_COMMAND_SIZE 160U
 
-/** 内部允许执行的 AT 指令白名单。 */
-static const char *const g_safe_commands[] = {
-    "AT",       "ATE0",       "ATI",        "AT+CSQ",    "AT+CESQ",
-    "AT+CEREG?", "AT+CGACT?",  "AT+CCID",    "AT+ICCID",  "AT+GSN",
-    "AT+COPS?", "AT+CPIN?",   "AT+CFUN?",   "AT+CMGF=0",
-    "AT+CNMI=2,2,0,0,0", "AT+CFUN=1,1"};
+typedef struct {
+    const char *command;
+    bool web_read_only;
+} allowed_command_t;
 
-/** Web API 允许执行的只读 AT 指令白名单。 */
-static const char *const g_read_only_commands[] = {
-    "AT", "ATI", "AT+CSQ", "AT+CESQ", "AT+CEREG?", "AT+CGACT?",
-    "AT+CCID", "AT+ICCID", "AT+GSN", "AT+COPS?", "AT+CPIN?", "AT+CFUN?"};
+/** 单一白名单同时描述内部命令和 Web 只读权限。 */
+static const allowed_command_t g_commands[] = {
+    {"AT", true}, {"ATE0", false}, {"ATI", true}, {"AT+CSQ", true},
+    {"AT+CESQ", true}, {"AT+CREG?", true}, {"AT+CGREG?", true},
+    {"AT+CEREG?", true}, {"AT+CIREG?", true}, {"AT+CGACT?", true},
+    {"AT+CCID", true}, {"AT+ICCID", true}, {"AT+GSN", true},
+    {"AT+COPS?", true}, {"AT+CPIN?", true}, {"AT+CNUM", true},
+    {"AT+CSMS?", true}, {"AT+CFUN?", true},
+    {"AT+MDIALUPCFG?", true}, {"AT+MDIALUP?", true}, {"AT+MIPCALL?", true},
+    {"AT+CMGF?", true}, {"AT+CNMI?", true}, {"AT+CPMS?", true},
+    {"AT+CMGL=4", true}, {"AT+CSCA?", true}, {"AT+MIPCALL=0,1", false},
+    {"AT+CMGF=0", false}, {"AT+MUECONFIG=\"AUTOCONN\",0", false},
+    {"AT+MDIALUPCFG=\"AUTO\",0", false}, {"AT+CNMI=2,2,0,0,0", false},
+    {"AT+CPMS=\"SM\",\"SM\",\"SM\"", false},
+    {"AT+CNMI=2,1,0,0,0", false},
+    {"AT+CFUN=1,1", false},
+};
 
 /**
  * @brief 删除空白并把指令转换为大写。
@@ -46,9 +57,10 @@ static bool normalize_command(const char *input, char *output, size_t output_siz
  * @param count 白名单元素数量。
  * @return 完全匹配时返回 true。
  */
-static bool command_in_list(const char *command, const char *const *list, size_t count) {
-    for (size_t index = 0; index < count; ++index) {
-        if (strcmp(command, list[index]) == 0) return true;
+static bool command_allowed(const char *command, bool web_only) {
+    for (size_t index = 0; index < sizeof(g_commands) / sizeof(g_commands[0]); ++index) {
+        if ((!web_only || g_commands[index].web_read_only) &&
+            strcmp(command, g_commands[index].command) == 0) return true;
     }
     return false;
 }
@@ -73,66 +85,55 @@ bool safety_is_pdp_deactivation_command(const char *command) {
     return end != normalized + sizeof(prefix) - 1U && *end == '\0' && cid > 0L && cid <= 255L;
 }
 
-bool safety_parse_active_pdp_contexts(const char *response, int *active, size_t capacity,
-                                      size_t *active_count) {
+bool safety_is_sms_delete_command(const char *command) {
+    static const char prefix[] = "AT+CMGD=";
+    char normalized[SAFETY_COMMAND_SIZE];
+    char *end = NULL;
+    long index;
+    if (!normalize_command(command, normalized, sizeof(normalized))) return false;
+    if (strncmp(normalized, prefix, sizeof(prefix) - 1U) != 0) return false;
+    index = strtol(normalized + sizeof(prefix) - 1U, &end, 10);
+    return end != normalized + sizeof(prefix) - 1U && *end == '\0' &&
+           index > 0L && index <= 255L;
+}
+
+bool safety_pdp_context_is_active(const char *response, int cid, bool *is_active) {
     const char *cursor = response;
     bool saw_context = false;
-    size_t count = 0;
-    if (response == NULL || active_count == NULL) return false;
-    *active_count = 0;
+    if (response == NULL || cid <= 0 || cid > 255 || is_active == NULL) return false;
+    *is_active = false;
     while ((cursor = strstr(cursor, "+CGACT:")) != NULL) {
         char *end = NULL;
-        long cid;
+        long found_cid;
         long state;
         cursor += 7;
-        cid = strtol(cursor, &end, 10);
+        found_cid = strtol(cursor, &end, 10);
         if (end == cursor) return false;
         while (*end == ' ' || *end == '\t') ++end;
         if (*end++ != ',') return false;
         cursor = end;
         state = strtol(cursor, &end, 10);
-        if (end == cursor || cid <= 0L || cid > 255L || (state != 0L && state != 1L)) return false;
+        if (end == cursor || found_cid <= 0L || found_cid > 255L ||
+            (state != 0L && state != 1L)) return false;
         saw_context = true;
-        if (state == 1L) {
-            if (active == NULL || count >= capacity) return false;
-            active[count++] = (int)cid;
-        }
+        if (found_cid == cid) *is_active = state == 1L;
         cursor = end;
     }
-    *active_count = count;
     return saw_context;
-}
-
-bool safety_pdp_context_is_active(const char *response, int cid, bool *is_active) {
-    int active[32];
-    size_t active_count = 0U;
-    if (cid <= 0 || cid > 255 || is_active == NULL ||
-        !safety_parse_active_pdp_contexts(response, active,
-                                          sizeof(active) / sizeof(active[0]), &active_count)) {
-        return false;
-    }
-    *is_active = false;
-    for (size_t index = 0U; index < active_count; ++index) {
-        if (active[index] == cid) {
-            *is_active = true;
-            break;
-        }
-    }
-    return true;
 }
 
 bool safety_is_safe_at_command(const char *command) {
     char normalized[SAFETY_COMMAND_SIZE];
     if (!normalize_command(command, normalized, sizeof(normalized))) return false;
     return !safety_is_forbidden_cellular_data_command(normalized) &&
-           command_in_list(normalized, g_safe_commands,
-                           sizeof(g_safe_commands) / sizeof(g_safe_commands[0]));
+           (command_allowed(normalized, false) ||
+            safety_is_pdp_deactivation_command(normalized) ||
+            safety_is_sms_delete_command(normalized));
 }
 
 bool safety_is_read_only_at_command(const char *command) {
     char normalized[SAFETY_COMMAND_SIZE];
     if (!normalize_command(command, normalized, sizeof(normalized))) return false;
     return !safety_is_forbidden_cellular_data_command(normalized) &&
-           command_in_list(normalized, g_read_only_commands,
-                           sizeof(g_read_only_commands) / sizeof(g_read_only_commands[0]));
+           command_allowed(normalized, true);
 }

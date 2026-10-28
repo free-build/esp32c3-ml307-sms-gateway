@@ -1,0 +1,23 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>短信网关配网</title><style>
+*{box-sizing:border-box}body{margin:0;font:15px system-ui;background:#edf3fa;color:#17243a}
+main{max-width:480px;margin:8vh auto;padding:18px}.card{background:#fff;border-radius:18px;padding:24px;box-shadow:0 12px 36px #2343}
+h1{margin:0 0 6px;font-size:24px}p{color:#66758c}label{display:block;margin-top:16px}
+input,select,button{width:100%;margin-top:6px;padding:12px;border:1px solid #c9d5e5;border-radius:10px;font:inherit}
+button{background:#1769e0;color:#fff;border:0;font-weight:700}button:disabled{opacity:.55}#manual{display:none}#msg{min-height:24px}
+</style></head><body><main><section class="card"><h1>短信网关配网</h1>
+<p>选择附近的 2.4 GHz Wi-Fi，连接成功后会自动打开管理后台。</p>
+<label>附近 Wi-Fi<select id="nets"><option>正在扫描…</option></select></label>
+<button id="scan" onclick="scanWifi()">重新扫描</button>
+<label id="manual">Wi-Fi 名称<input id="ssid" maxlength="32"></label>
+<label>Wi-Fi 密码<input id="password" type="password" maxlength="63"></label>
+<button id="save" onclick="connectWifi()">保存并连接</button><p id="msg"></p>
+</section></main><script>
+let csrf='';const wait=ms=>new Promise(r=>setTimeout(r,ms));
+async function json(url,opt){let r=await fetch(url,opt),t=await r.text(),d={};try{d=JSON.parse(t)}catch(e){d={message:t}}if(!r.ok)throw Error(d.message||`HTTP ${r.status}`);return d}
+function selected(){let o=nets.selectedOptions[0];if(!o)return;manual.style.display=o.dataset.manual?'block':'none';ssid.value=o.dataset.manual?'':o.value}
+async function scanWifi(){scan.disabled=true;msg.textContent='正在扫描…';try{let d=await json('/api/wifi/scan');nets.textContent='';for(let n of d.networks){let o=new Option(`${n.ssid}  ${n.rssi} dBm${n.secure?'  🔒':''}`,n.ssid);nets.add(o)}let o=new Option('隐藏网络 / 手动输入','');o.dataset.manual='1';nets.add(o);nets.selectedIndex=d.networks.length?0:nets.length-1;selected();msg.textContent=`找到 ${d.networks.length} 个网络`}catch(e){msg.textContent=e.message}finally{scan.disabled=false}}
+async function connectWifi(){save.disabled=true;msg.textContent='正在连接…';try{let d=await json('/api/provision',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({ssid:ssid.value,password:password.value})});msg.textContent=d.message;for(let i=0;i<35;i++){await wait(1000);d=await json('/api/provision/status',{cache:'no-store'});if(d.state===2&&d.management_url){location.href=d.management_url;return}if(d.state===3)throw Error('连接失败，请检查密码')}}catch(e){msg.textContent=e.message;save.disabled=false}}
+nets.onchange=selected;(async()=>{try{let s=await json('/api/session',{cache:'no-store'});if(s.auth_enabled&&!s.authenticated){let p=prompt('请输入管理密码');s=await json('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:'admin',password:p||''})})}csrf=s.csrf;await scanWifi()}catch(e){msg.textContent=e.message}})();
+</script></body></html>

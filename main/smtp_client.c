@@ -1,6 +1,7 @@
 #include "smtp_client.h"
 
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "mbedtls/base64.h"
@@ -15,7 +16,7 @@
 /** SMTP 单行响应最大长度。 */
 #define SMTP_LINE_SIZE 1025U
 /** SMTP Base64 临时缓冲区长度。 */
-#define SMTP_BASE64_SIZE 4096U
+#define SMTP_BASE64_SIZE 512U
 
 /** SMTP 日志标签。 */
 static const char *const g_tag = "smtp";
@@ -236,6 +237,9 @@ bool smtp_client_send(const smtp_client_config_t *config, const char *subject, c
         set_error(error, error_size, "only certificate-verified SMTPS 465 and STARTTLS 587 are supported");
         return false;
     }
+    ESP_LOGI(g_tag, "starting TLS with %u bytes free, largest block %u bytes",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     transport_init(&transport);
     if (!transport_connect(&transport, config->server, config->port, !starttls,
                            error, error_size) ||

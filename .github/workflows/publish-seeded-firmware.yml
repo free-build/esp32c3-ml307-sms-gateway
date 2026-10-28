@@ -22,7 +22,7 @@ jobs:
           dd if=firmware/latest/factory-install.bin of=firmware/latest/bootloader.bin bs=1 count=21168 status=none
           dd if=firmware/latest/factory-install.bin of=firmware/latest/partition-table.bin bs=1 skip=32768 count=3072 status=none
           dd if=firmware/latest/factory-install.bin of=firmware/latest/ota_data_initial.bin bs=1 skip=57344 count=8192 status=none
-          dd if=firmware/latest/factory-install.bin of=firmware/latest/sms_forwarding_idf.bin bs=1 skip=65536 count=1207312 status=none
+          dd if=firmware/latest/factory-install.bin of=firmware/latest/sms_forwarding_idf.bin bs=1 skip=65536 count=1199024 status=none
           (cd firmware/latest && sha256sum -c SHA256SUMS)
       - name: Commit firmware files
         run: |

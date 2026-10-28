@@ -210,9 +210,10 @@ static esp_err_t inbox_storage_start(void) {
 }
 
 /** @brief 将一条已接受短信保存到环形收件箱并持久化。 */
-static void inbox_store(const sms_message_t *sms) {
+static uint32_t inbox_store(const sms_message_t *sms) {
     size_t slot;
-    if (sms == NULL || g_inbox_mutex == NULL) return;
+    uint32_t id = 0U;
+    if (sms == NULL || g_inbox_mutex == NULL) return 0U;
     xSemaphoreTake(g_inbox_mutex, portMAX_DELAY);
     slot = (g_inbox_head + g_inbox_count) % SMS_INBOX_CAPACITY;
     if (g_inbox_count == SMS_INBOX_CAPACITY) {
@@ -221,10 +222,12 @@ static void inbox_store(const sms_message_t *sms) {
     } else {
         ++g_inbox_count;
     }
-    g_inbox[slot].id = g_inbox_next_id++;
+    id = g_inbox_next_id++;
+    g_inbox[slot].id = id;
     memcpy(&g_inbox[slot].message, sms, sizeof(*sms));
     inbox_persist_locked();
     xSemaphoreGive(g_inbox_mutex);
+    return id;
 }
 
 /** @brief 去除字符串两端空白并复制到输出缓冲区。 */
@@ -292,22 +295,20 @@ static concat_slot_t *find_or_allocate(const decoded_sms_t *sms) {
 
 /** @brief 执行黑名单、管理员命令和通知分发。 */
 static void deliver(const sms_message_t *sms) {
-    app_config_t *config = malloc(sizeof(*config));
+    config_sms_policy_t policy;
     char command[APP_SMS_TEXT_SIZE];
-    if (config == NULL) return;
-    config_store_get(config);
-    if (blacklisted(sms->sender, config->number_blacklist)) {
-        ESP_LOGI(g_tag, "message ignored by sender blacklist");
-        free(config);
+    /* 收件箱是短信接收的主记录，不得受通知配置内存分配影响。 */
+    const uint32_t inbox_id = inbox_store(sms);
+    config_store_get_sms_policy(&policy);
+    if (blacklisted(sms->sender, policy.number_blacklist)) {
+        ESP_LOGI(g_tag, "SMS saved; notification ignored by sender blacklist");
         return;
     }
-    inbox_store(sms);
     trim_copy(sms->text, command, sizeof(command));
-    if (config->admin_commands_enabled && sms_service_phone_equal(sms->sender, config->admin_phone)) {
+    if (policy.admin_commands_enabled && sms_service_phone_equal(sms->sender, policy.admin_phone)) {
         if (strcmp(command, "RESET") == 0) {
             ESP_LOGW(g_tag, "authorized administrator reset command received");
             xTaskCreate(delayed_system_restart, "admin_restart", 2048U, NULL, 10U, NULL);
-            free(config);
             return;
         }
         if (strncmp(command, "SMS:", 4U) == 0) {
@@ -315,16 +316,17 @@ static void deliver(const sms_message_t *sms) {
             if (separator != NULL) {
                 *separator = '\0';
                 modem_service_submit_sms(command + 4U, separator + 1U);
-                free(config);
                 return;
             }
         }
     }
-    notification_service_enqueue_sms(sms);
+    if (inbox_id == 0U || !notification_service_enqueue_inbox(inbox_id)) {
+        ESP_LOGE(g_tag, "SMS saved, but notification queue rejected inbox id %lu",
+                 (unsigned long)inbox_id);
+    }
     char masked[4] = {0};
     snprintf(masked, sizeof(masked), "%.3s", sms->sender);
     ESP_LOGI(g_tag, "SMS accepted from %s******", masked);
-    free(config);
 }
 
 /** @brief 合并或直接投递一条解码短信。 */
@@ -454,6 +456,49 @@ bool sms_service_inbox_get(size_t newest_index, sms_inbox_entry_t *entry) {
         const size_t slot = (g_inbox_head + g_inbox_count - 1U - newest_index) % SMS_INBOX_CAPACITY;
         memcpy(entry, &g_inbox[slot], sizeof(*entry));
         found = true;
+    }
+    xSemaphoreGive(g_inbox_mutex);
+    return found;
+}
+
+bool sms_service_inbox_find(uint32_t id, sms_inbox_entry_t *entry) {
+    bool found = false;
+    if (id == 0U || entry == NULL || g_inbox_mutex == NULL) return false;
+    xSemaphoreTake(g_inbox_mutex, portMAX_DELAY);
+    for (size_t index = 0U; index < g_inbox_count; ++index) {
+        const size_t slot = (g_inbox_head + index) % SMS_INBOX_CAPACITY;
+        if (g_inbox[slot].id == id) {
+            memcpy(entry, &g_inbox[slot], sizeof(*entry));
+            found = true;
+            break;
+        }
+    }
+    xSemaphoreGive(g_inbox_mutex);
+    return found;
+}
+
+bool sms_service_inbox_delete(uint32_t id) {
+    bool found = false;
+    if (id == 0U || g_inbox_mutex == NULL) return false;
+    xSemaphoreTake(g_inbox_mutex, portMAX_DELAY);
+    for (size_t index = 0U; index < g_inbox_count; ++index) {
+        const size_t slot = (g_inbox_head + index) % SMS_INBOX_CAPACITY;
+        if (g_inbox[slot].id == id) {
+            found = true;
+            for (size_t move = index; move + 1U < g_inbox_count; ++move) {
+                const size_t destination = (g_inbox_head + move) % SMS_INBOX_CAPACITY;
+                const size_t source = (g_inbox_head + move + 1U) % SMS_INBOX_CAPACITY;
+                memcpy(&g_inbox[destination], &g_inbox[source], sizeof(g_inbox[0]));
+            }
+            const size_t last = (g_inbox_head + g_inbox_count - 1U) % SMS_INBOX_CAPACITY;
+            memset(&g_inbox[last], 0, sizeof(g_inbox[last]));
+            --g_inbox_count;
+            if (g_inbox_count == 0U) g_inbox_head = 0U;
+            break;
+        }
+    }
+    if (found) {
+        inbox_persist_locked();
     }
     xSemaphoreGive(g_inbox_mutex);
     return found;

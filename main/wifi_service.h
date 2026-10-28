@@ -29,7 +29,7 @@ typedef enum {
 esp_err_t wifi_service_start(void);
 
 /** @brief 保存新 Wi-Fi 凭据并从配网热点切换到 STA。 */
-esp_err_t wifi_service_update_credentials(const char *ssid, const char *password);
+esp_err_t wifi_service_update_credentials(const char *ssid, const char *password, int replace_slot);
 
 /** @brief 主动触发 STA 重连。 */
 esp_err_t wifi_service_reconnect(void);
@@ -58,3 +58,15 @@ void wifi_service_ip_address(char *output, size_t output_size);
 
 /** @brief 返回 STA RSSI；未连接时返回 -127。 */
 int8_t wifi_service_rssi(void);
+
+/** @brief 返回当前连接的 Wi-Fi 槽位，未连接时返回 -1。 */
+int wifi_service_active_slot(void);
+
+/** @brief 返回连续离线时长，单位秒。 */
+uint32_t wifi_service_outage_seconds(void);
+
+/** @brief 返回本次离线期间的重连次数。 */
+uint32_t wifi_service_reconnect_attempts(void);
+
+/** @brief 返回最近一次 STA 断开原因。 */
+int32_t wifi_service_last_disconnect_reason(void);

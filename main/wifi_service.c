@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -17,8 +18,8 @@
 #include <stdio.h>
 #include <string.h>
 
-/** STA 快速重连次数阈值。 */
-#define WIFI_MAX_FAST_RETRIES 10U
+/** 连续离线超过此时间后开启恢复热点。 */
+#define WIFI_RECOVERY_DELAY_US (180LL * 1000000LL)
 /** 配网响应发送完成后切换到 STA 的延迟。 */
 #define WIFI_PROVISION_SWITCH_DELAY_MS 800U
 /** 新凭据试连超时；失败后恢复配网热点且不持久化错误凭据。 */
@@ -30,6 +31,7 @@
 typedef struct {
     char ssid[APP_WIFI_SSID_SIZE];
     char password[APP_WIFI_PASSWORD_SIZE];
+    uint8_t slot;
 } wifi_transition_request_t;
 
 /** 模块日志标签。 */
@@ -42,6 +44,8 @@ static esp_netif_t *g_ap_netif;
 static captive_dns_handle_t g_dns_server;
 /** STA 是否已经获得 IP 地址。 */
 static atomic_bool g_connected;
+/** STA 驱动是否正在建立连接。 */
+static atomic_bool g_connecting;
 /** 设备是否处于 AP 配网模式。 */
 static atomic_bool g_provisioning;
 /** 当前连续重连计数。 */
@@ -52,7 +56,14 @@ static atomic_bool g_transition_pending;
 static atomic_bool g_scan_active;
 /** 当前配网连接过程状态。 */
 static atomic_int g_provision_state;
-
+/** 当前正在尝试或已连接的凭据槽位。 */
+static atomic_int g_active_slot = -1;
+/** 连续离线起始时间。 */
+static atomic_llong g_offline_since_us;
+/** 最近一次断开原因。 */
+static atomic_int g_last_disconnect_reason;
+/** 管理重连与恢复热点的后台任务。 */
+static TaskHandle_t g_manager_task;
 /** @brief 启动开放式配网 AP，供异步切换失败时恢复。 */
 static esp_err_t start_provisioning_ap(void);
 
@@ -69,20 +80,20 @@ static void wifi_event_handler(void *argument, esp_event_base_t base, int32_t id
         ESP_LOGI(g_tag, "portal client " MACSTR " left, aid=%d reason=%d",
                  MAC2STR(event->mac), event->aid, event->reason);
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        /* AP+STA 配网模式只借用 STA 做扫描，尚未提交凭据时不执行连接重试。 */
-        if (atomic_load(&g_provisioning)) return;
-        const unsigned attempts = atomic_fetch_add(&g_reconnect_attempts, 1U) + 1U;
+        const wifi_event_sta_disconnected_t *event = (const wifi_event_sta_disconnected_t *)data;
         atomic_store(&g_connected, false);
-        if (attempts > WIFI_MAX_FAST_RETRIES) {
-            ESP_LOGW(g_tag, "Wi-Fi remains disconnected after %u attempts; background reconnect continues",
-                     attempts);
-            atomic_store(&g_reconnect_attempts, 0U);
-        }
-        esp_wifi_connect();
+        atomic_store(&g_connecting, false);
+        atomic_store(&g_last_disconnect_reason, event->reason);
+        if (atomic_load(&g_offline_since_us) == 0) atomic_store(&g_offline_since_us, esp_timer_get_time());
+        if (g_manager_task != NULL) xTaskNotifyGive(g_manager_task);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)data;
         atomic_store(&g_connected, true);
+        atomic_store(&g_connecting, false);
         atomic_store(&g_reconnect_attempts, 0U);
+        atomic_store(&g_offline_since_us, 0);
+        const int slot = atomic_load(&g_active_slot);
+        if (slot >= 0) config_store_mark_wifi_success((uint8_t)slot);
         ESP_LOGI(g_tag, "station connected: " IPSTR, IP2STR(&event->ip_info.ip));
     }
 }
@@ -90,24 +101,103 @@ static void wifi_event_handler(void *argument, esp_event_base_t base, int32_t id
 /**
  * @brief 使用给定凭据启动 STA。
  */
-static esp_err_t start_station(const char *ssid, const char *password) {
+static esp_err_t apply_station_profile(uint8_t slot, const wifi_profile_t *profile) {
     wifi_config_t config = {0};
-    atomic_store(&g_provisioning, false);
-    atomic_store(&g_connected, false);
-    atomic_store(&g_reconnect_attempts, 0U);
-    memcpy(config.sta.ssid, ssid,
-           strlen(ssid) < sizeof(config.sta.ssid) ? strlen(ssid) : sizeof(config.sta.ssid));
-    memcpy(config.sta.password, password,
-           strlen(password) < sizeof(config.sta.password) ? strlen(password) : sizeof(config.sta.password));
+    memcpy(config.sta.ssid, profile->ssid, strlen(profile->ssid));
+    memcpy(config.sta.password, profile->password, strlen(profile->password));
     config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
     config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
-    config.sta.threshold.authmode = password[0] == '\0' ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), g_tag, "station mode");
+    config.sta.threshold.authmode = profile->password[0] == '\0' ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &config), g_tag, "station config");
-    ESP_RETURN_ON_ERROR(esp_wifi_start(), g_tag, "wifi start");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), g_tag, "disable wifi power save");
-    ESP_LOGI(g_tag, "connecting to configured Wi-Fi SSID");
-    return esp_wifi_connect();
+    atomic_store(&g_active_slot, slot);
+    ESP_LOGI(g_tag, "connecting Wi-Fi profile slot %u, SSID '%s'", (unsigned)slot, profile->ssid);
+    const esp_err_t error = esp_wifi_connect();
+    atomic_store(&g_connecting, error == ESP_OK);
+    return error;
+}
+
+/** @brief 按最近成功优先的顺序选取第 N 个凭据槽位。 */
+static int ordered_profile_slot(const wifi_profile_t profiles[APP_MAX_WIFI_PROFILES],
+                                uint8_t preferred, unsigned ordinal) {
+    if (preferred < APP_MAX_WIFI_PROFILES && profiles[preferred].used) {
+        if (ordinal == 0U) return preferred;
+        --ordinal;
+    }
+    for (size_t slot = 0U; slot < APP_MAX_WIFI_PROFILES; ++slot) {
+        if (!profiles[slot].used || slot == preferred) continue;
+        if (ordinal-- == 0U) return (int)slot;
+    }
+    return -1;
+}
+
+/** @brief 成功连网后关闭恢复热点。 */
+static void close_recovery_ap(void) {
+    atomic_store(&g_provision_state, APP_WIFI_PROVISION_CONNECTED);
+    atomic_store(&g_provisioning, false);
+    vTaskDelay(pdMS_TO_TICKS(WIFI_PROVISION_REDIRECT_GRACE_MS));
+    if (g_dns_server != NULL) captive_dns_stop(g_dns_server);
+    g_dns_server = NULL;
+    const esp_err_t error = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (error != ESP_OK) ESP_LOGE(g_tag, "cannot close recovery AP: %s", esp_err_to_name(error));
+}
+
+/** @brief 以退避方式轮询三组凭据，并在长时间离线后开启门户。 */
+static void wifi_manager(void *argument) {
+    (void)argument;
+    static const uint32_t backoff_seconds[] = {1U, 2U, 5U, 10U, 30U};
+    unsigned ordinal = 0U;
+    int64_t next_attempt_us = 0;
+    for (;;) {
+        if (atomic_load(&g_connected)) {
+            if (atomic_load(&g_provisioning) && !atomic_load(&g_transition_pending)) close_recovery_ap();
+            ordinal = 0U;
+            next_attempt_us = 0;
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000U));
+            continue;
+        }
+        if (atomic_load(&g_offline_since_us) == 0) atomic_store(&g_offline_since_us, esp_timer_get_time());
+        const int64_t elapsed = esp_timer_get_time() - atomic_load(&g_offline_since_us);
+        if (elapsed >= WIFI_RECOVERY_DELAY_US && !atomic_load(&g_provisioning)) {
+            start_provisioning_ap();
+        }
+        if (atomic_load(&g_transition_pending) || atomic_load(&g_scan_active) ||
+            atomic_load(&g_connecting)) {
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000U));
+            continue;
+        }
+        {
+            wifi_profile_t profiles[APP_MAX_WIFI_PROFILES];
+            uint8_t preferred = UINT8_MAX;
+            const size_t count = config_store_get_wifi_profiles(profiles, &preferred);
+            if (count > 0U) {
+                const unsigned attempts = atomic_load(&g_reconnect_attempts);
+                if (attempts > 0U) {
+                    const size_t backoff_index = (attempts - 1U) <
+                        (sizeof(backoff_seconds) / sizeof(backoff_seconds[0]))
+                            ? attempts - 1U
+                            : (sizeof(backoff_seconds) / sizeof(backoff_seconds[0]) - 1U);
+                    if (next_attempt_us == 0) {
+                        next_attempt_us = esp_timer_get_time() +
+                            (int64_t)backoff_seconds[backoff_index] * 1000000LL;
+                    }
+                    const int64_t remaining_us = next_attempt_us - esp_timer_get_time();
+                    if (remaining_us > 0) {
+                        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS((uint32_t)(remaining_us / 1000LL + 1LL)));
+                        continue;
+                    }
+                }
+                const int slot = ordered_profile_slot(profiles, preferred, ordinal % count);
+                if (slot >= 0) {
+                    if (apply_station_profile((uint8_t)slot, &profiles[slot]) == ESP_OK) {
+                        atomic_fetch_add(&g_reconnect_attempts, 1U);
+                    }
+                    ++ordinal;
+                    next_attempt_us = 0;
+                }
+            }
+        }
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000U));
+    }
 }
 
 /**
@@ -126,6 +216,7 @@ static void delayed_station_transition(void *argument) {
     station_config.sta.threshold.authmode = request->password[0] == '\0'
         ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
     atomic_store(&g_connected, false);
+    atomic_store(&g_connecting, true);
     atomic_store(&g_provision_state, APP_WIFI_PROVISION_CONNECTING);
     error = esp_wifi_set_config(WIFI_IF_STA, &station_config);
     if (error == ESP_OK) error = esp_wifi_connect();
@@ -135,29 +226,19 @@ static void delayed_station_transition(void *argument) {
                xTaskGetTickCount() - started < pdMS_TO_TICKS(WIFI_PROVISION_CONNECT_TIMEOUT_MS)) {
             vTaskDelay(pdMS_TO_TICKS(100U));
         }
-        error = atomic_load(&g_connected)
-            ? config_store_set_wifi(request->ssid, request->password)
-            : ESP_ERR_TIMEOUT;
+        error = atomic_load(&g_connected) ? ESP_OK : ESP_ERR_TIMEOUT;
     }
     if (error != ESP_OK) {
         ESP_LOGE(g_tag, "new Wi-Fi credentials were not accepted; portal remains active: %s",
                  esp_err_to_name(error));
         esp_wifi_disconnect();
         atomic_store(&g_connected, false);
+        atomic_store(&g_connecting, false);
         atomic_store(&g_provision_state, APP_WIFI_PROVISION_FAILED);
     } else {
-        ESP_LOGI(g_tag, "new Wi-Fi credentials verified and saved");
-        atomic_store(&g_provision_state, APP_WIFI_PROVISION_CONNECTED);
-        /* 后台地址一旦可用，HTTP 根路径立即切换为管理页。 */
-        atomic_store(&g_provisioning, false);
-        /* 让门户页面先读取 STA 地址并跳转，再关闭开放热点。 */
-        vTaskDelay(pdMS_TO_TICKS(WIFI_PROVISION_REDIRECT_GRACE_MS));
-        captive_dns_stop(g_dns_server);
-        g_dns_server = NULL;
-        error = esp_wifi_set_mode(WIFI_MODE_STA);
-        if (error != ESP_OK) {
-            ESP_LOGE(g_tag, "cannot close provisioning AP: %s", esp_err_to_name(error));
-        }
+        config_store_mark_wifi_success(request->slot);
+        ESP_LOGI(g_tag, "new Wi-Fi credentials connected successfully");
+        close_recovery_ap();
     }
     memset(request, 0, sizeof(*request));
     free(request);
@@ -183,7 +264,10 @@ static esp_err_t start_provisioning_ap(void) {
     if (g_ap_netif == NULL) g_ap_netif = esp_netif_create_default_wifi_ap();
     if (g_ap_netif == NULL) return ESP_ERR_NO_MEM;
     esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
-    snprintf(ssid, sizeof(ssid), "SMS-Setup-%02X%02X", mac[4], mac[5]);
+    wifi_profile_t profiles[APP_MAX_WIFI_PROFILES];
+    const bool recovery = config_store_get_wifi_profiles(profiles, NULL) > 0U;
+    snprintf(ssid, sizeof(ssid), recovery ? "SMS-Recovery-%02X%02X" : "SMS-Setup-%02X%02X",
+             mac[4], mac[5]);
     memcpy(config.ap.ssid, ssid, strlen(ssid));
     config.ap.ssid_len = strlen(ssid);
     config.ap.max_connection = 4U;
@@ -218,8 +302,8 @@ static esp_err_t start_provisioning_ap(void) {
 }
 
 esp_err_t wifi_service_start(void) {
-    char ssid[APP_WIFI_SSID_SIZE];
-    char password[APP_WIFI_PASSWORD_SIZE];
+    wifi_profile_t profiles[APP_MAX_WIFI_PROFILES];
+    uint8_t preferred = UINT8_MAX;
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     esp_err_t event_error;
     ESP_RETURN_ON_ERROR(esp_netif_init(), g_tag, "netif init");
@@ -235,17 +319,28 @@ esp_err_t wifi_service_start(void) {
                                                    wifi_event_handler, NULL), g_tag,
                         "ip event handler");
     ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), g_tag, "wifi storage");
-    config_store_get_wifi(ssid, sizeof(ssid), password, sizeof(password));
-    return ssid[0] == '\0' ? start_provisioning_ap() : start_station(ssid, password);
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), g_tag, "station mode");
+    ESP_RETURN_ON_ERROR(esp_wifi_start(), g_tag, "wifi start");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), g_tag, "disable wifi power save");
+    const size_t count = config_store_get_wifi_profiles(profiles, &preferred);
+    esp_err_t error = ESP_OK;
+    if (count == 0U) error = start_provisioning_ap();
+    else {
+        const int slot = ordered_profile_slot(profiles, preferred, 0U);
+        error = apply_station_profile((uint8_t)slot, &profiles[slot]);
+    }
+    if (error == ESP_OK && xTaskCreate(wifi_manager, "wifi_manager", 4096U, NULL, 5U,
+                                       &g_manager_task) != pdPASS) return ESP_ERR_NO_MEM;
+    return error;
 }
 
-esp_err_t wifi_service_update_credentials(const char *ssid, const char *password) {
+esp_err_t wifi_service_update_credentials(const char *ssid, const char *password, int replace_slot) {
     const size_t ssid_length = ssid != NULL ? strlen(ssid) : 0U;
     const size_t password_length = password != NULL ? strlen(password) : 0U;
     wifi_transition_request_t *request;
     if (ssid_length == 0U || ssid_length > 32U || password_length > 63U ||
         (password_length != 0U && password_length < 8U)) return ESP_ERR_INVALID_ARG;
-    if (atomic_exchange(&g_transition_pending, true)) return ESP_ERR_INVALID_STATE;
+    if (!atomic_load(&g_provisioning) || atomic_exchange(&g_transition_pending, true)) return ESP_ERR_INVALID_STATE;
     atomic_store(&g_provision_state, APP_WIFI_PROVISION_CONNECTING);
     request = calloc(1U, sizeof(*request));
     if (request == NULL) {
@@ -254,6 +349,22 @@ esp_err_t wifi_service_update_credentials(const char *ssid, const char *password
     }
     snprintf(request->ssid, sizeof(request->ssid), "%s", ssid);
     snprintf(request->password, sizeof(request->password), "%s", password);
+    wifi_profile_t profiles[APP_MAX_WIFI_PROFILES];
+    config_store_get_wifi_profiles(profiles, NULL);
+    for (size_t slot = 0U; slot < APP_MAX_WIFI_PROFILES; ++slot) {
+        if (profiles[slot].used && strcmp(profiles[slot].ssid, ssid) == 0) {
+            replace_slot = (int)slot;
+            break;
+        }
+    }
+    esp_err_t save_error = config_store_save_wifi_profile(replace_slot, ssid, password, false,
+                                                          &request->slot);
+    if (save_error != ESP_OK) {
+        free(request);
+        atomic_store(&g_transition_pending, false);
+        return save_error;
+    }
+    atomic_store(&g_active_slot, request->slot);
     if (xTaskCreate(delayed_station_transition, "wifi_transition", 4096U, request, 6U, NULL) != pdPASS) {
         memset(request, 0, sizeof(*request));
         free(request);
@@ -264,10 +375,13 @@ esp_err_t wifi_service_update_credentials(const char *ssid, const char *password
 }
 
 esp_err_t wifi_service_reconnect(void) {
-    if (atomic_load(&g_provisioning)) return ESP_ERR_INVALID_STATE;
+    wifi_profile_t profiles[APP_MAX_WIFI_PROFILES];
     esp_wifi_disconnect();
     atomic_store(&g_reconnect_attempts, 0U);
-    return esp_wifi_connect();
+    atomic_store(&g_offline_since_us, config_store_get_wifi_profiles(profiles, NULL) == 0U
+        ? esp_timer_get_time() - WIFI_RECOVERY_DELAY_US : esp_timer_get_time());
+    if (g_manager_task != NULL) xTaskNotifyGive(g_manager_task);
+    return ESP_OK;
 }
 
 esp_err_t wifi_service_scan(app_wifi_network_t *networks, size_t capacity, size_t *count) {
@@ -350,6 +464,19 @@ int8_t wifi_service_rssi(void) {
     if (!wifi_service_connected()) return -127;
     return esp_wifi_sta_get_ap_info(&record) == ESP_OK ? record.rssi : -127;
 }
+
+int wifi_service_active_slot(void) {
+    return wifi_service_connected() ? atomic_load(&g_active_slot) : -1;
+}
+
+uint32_t wifi_service_outage_seconds(void) {
+    const int64_t since = atomic_load(&g_offline_since_us);
+    return since == 0 ? 0U : (uint32_t)((esp_timer_get_time() - since) / 1000000LL);
+}
+
+uint32_t wifi_service_reconnect_attempts(void) { return atomic_load(&g_reconnect_attempts); }
+
+int32_t wifi_service_last_disconnect_reason(void) { return atomic_load(&g_last_disconnect_reason); }
 
 app_wifi_provision_state_t wifi_service_provision_status(char *ip, size_t ip_size) {
     const app_wifi_provision_state_t state =

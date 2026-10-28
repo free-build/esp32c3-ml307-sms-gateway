@@ -11,8 +11,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "modem_service.h"
+#include "notification_service.h"
 #include "sms_service.h"
-#include "web_ui.h"
 #include "wifi_service.h"
 
 #include <stdarg.h>
@@ -21,8 +21,10 @@
 #include <string.h>
 
 /** ESP-IDF 构建系统嵌入的正式管理页面。 */
-extern const unsigned char management_html_start[] asm("_binary_management_html_start");
-extern const unsigned char management_html_end[] asm("_binary_management_html_end");
+extern const unsigned char management_html_gz_start[] asm("_binary_management_html_gz_start");
+extern const unsigned char management_html_gz_end[] asm("_binary_management_html_gz_end");
+extern const unsigned char provision_html_start[] asm("_binary_provision_html_start");
+extern const unsigned char provision_html_end[] asm("_binary_provision_html_end");
 
 /** HTTP JSON 请求体最大长度。 */
 #define WEB_MAX_BODY 8192U
@@ -33,7 +35,7 @@ extern const unsigned char management_html_end[] asm("_binary_management_html_en
 /** 会话令牌和 CSRF 令牌的十六进制字符数。 */
 #define WEB_TOKEN_HEX_LENGTH 48U
 /** Web 可查看日志的行数。 */
-#define WEB_LOG_LINE_COUNT 120U
+#define WEB_LOG_LINE_COUNT 60U
 /** 单行日志的最大长度。 */
 #define WEB_LOG_LINE_SIZE 256U
 /** 连续登录失败次数阈值。 */
@@ -63,6 +65,10 @@ static web_session_t g_sessions[WEB_SESSION_CAPACITY];
 static SemaphoreHandle_t g_session_mutex;
 /** 保护日志环形缓冲区的互斥锁。 */
 static SemaphoreHandle_t g_log_mutex;
+/** 保护管理配置快照，不在请求期间临时分配约 18 KB 堆内存。 */
+static SemaphoreHandle_t g_config_request_mutex;
+/** 配置 API 复用的固定快照缓冲区。 */
+static app_config_t g_config_snapshot;
 /** Web 日志环形缓冲区。 */
 static char g_log_lines[WEB_LOG_LINE_COUNT][WEB_LOG_LINE_SIZE];
 /** 日志环形缓冲区中最旧行的位置。 */
@@ -258,10 +264,32 @@ static esp_err_t root_handler(httpd_req_t *request) {
     httpd_resp_set_hdr(request, "Cache-Control", "no-store, no-cache, must-revalidate");
     httpd_resp_set_hdr(request, "Pragma", "no-cache");
     if (wifi_service_provisioning()) {
-        return httpd_resp_send(request, g_web_provision_page, HTTPD_RESP_USE_STRLEN);
+        return httpd_resp_send(request, (const char *)provision_html_start,
+                               (ssize_t)(provision_html_end - provision_html_start));
     }
-    return httpd_resp_send(request, (const char *)management_html_start,
-                           (ssize_t)(management_html_end - management_html_start - 1U));
+    /*
+     * 管理页原文约 30 KB，弱信号下会占用大量 TCP 窗口并可能让
+     * ESP32-C3 的 Wi-Fi 链路陷入长时间重传。预压缩后只需传输约 9 KB。
+     */
+    httpd_resp_set_hdr(request, "Content-Encoding", "gzip");
+    httpd_resp_set_hdr(request, "Vary", "Accept-Encoding");
+    const size_t page_size = (size_t)(management_html_gz_end - management_html_gz_start);
+    size_t offset = 0U;
+    while (offset < page_size) {
+        const size_t remaining = page_size - offset;
+        const size_t chunk_size = remaining < 512U ? remaining : 512U;
+        const esp_err_t error = httpd_resp_send_chunk(
+            request, (const char *)management_html_gz_start + offset, chunk_size);
+        if (error != ESP_OK) {
+            ESP_LOGW(g_tag, "management page transfer stopped at %u/%u bytes: %s",
+                     (unsigned)offset, (unsigned)page_size, esp_err_to_name(error));
+            return error;
+        }
+        offset += chunk_size;
+        /* 弱信号下主动给 Wi-Fi/TCP 任务回收发送窗口的时间。 */
+        vTaskDelay(pdMS_TO_TICKS(20U));
+    }
+    return httpd_resp_send_chunk(request, NULL, 0U);
 }
 
 /** @brief 保存 AP 配网页提交的 Wi-Fi 凭据。 */
@@ -274,11 +302,14 @@ static esp_err_t provision_handler(httpd_req_t *request) {
     if (json == NULL) return send_message(request, 400, "invalid JSON body");
     const bool valid = json_string(json, "ssid", ssid, sizeof(ssid), true) &&
                        json_string(json, "password", password, sizeof(password), true);
+    cJSON *replace_item = cJSON_GetObjectItemCaseSensitive(json, "replace_slot");
+    const int replace_slot = cJSON_IsNumber(replace_item) ? replace_item->valueint : -1;
     cJSON_Delete(json);
-    if (!valid || wifi_service_update_credentials(ssid, password) != ESP_OK) {
+    if (!valid || replace_slot >= (int)APP_MAX_WIFI_PROFILES ||
+        wifi_service_update_credentials(ssid, password, replace_slot) != ESP_OK) {
         return send_message(request, 400, "invalid Wi-Fi credentials");
     }
-    return send_message(request, 202, "credentials accepted; testing Wi-Fi before saving");
+    return send_message(request, 202, "credentials saved; connecting to Wi-Fi");
 }
 
 /** @brief 扫描并返回配网热点附近的 2.4 GHz Wi-Fi。 */
@@ -389,26 +420,25 @@ static esp_err_t logout_handler(httpd_req_t *request) {
 static esp_err_t status_handler(httpd_req_t *request) {
     char ip[16];
     modem_status_t modem;
-    app_config_t *config;
-    unsigned channel_count = 0U;
+    config_status_summary_t summary;
     if (!authenticated(request, false)) return send_message(request, 401, "authentication required");
     wifi_service_ip_address(ip, sizeof(ip));
     modem_service_status(&modem);
-    config = malloc(sizeof(*config));
-    if (config == NULL) return send_message(request, 500, "out of memory");
-    config_store_get(config);
-    for (size_t index = 0U; index < APP_MAX_PUSH_CHANNELS; ++index) {
-        if (config->push_channels[index].enabled) ++channel_count;
-    }
+    config_store_get_status_summary(wifi_service_active_slot(), &summary);
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "ip", ip);
     cJSON_AddBoolToObject(root, "wifi_connected", wifi_service_connected());
     cJSON_AddNumberToObject(root, "wifi_rssi", wifi_service_rssi());
+    cJSON_AddStringToObject(root, "wifi_state", wifi_service_connected() ? "online" :
+                           (wifi_service_provisioning() ? "recovery" : "connecting"));
+    cJSON_AddBoolToObject(root, "wifi_recovery_active", wifi_service_provisioning());
+    cJSON_AddNumberToObject(root, "wifi_outage_seconds", wifi_service_outage_seconds());
+    cJSON_AddNumberToObject(root, "wifi_reconnect_attempts", wifi_service_reconnect_attempts());
+    cJSON_AddNumberToObject(root, "wifi_last_disconnect_reason", wifi_service_last_disconnect_reason());
     cJSON_AddBoolToObject(root, "modem_ready", modem_service_ready());
     cJSON_AddBoolToObject(root, "packet_data_disabled", modem_service_data_safely_disabled());
     cJSON_AddStringToObject(root, "idf_version", esp_get_idf_version());
-    cJSON_AddBoolToObject(root, "password_change_required", config_store_password_change_required());
-    cJSON_AddStringToObject(root, "wifi_ssid", config->wifi_ssid);
+    cJSON_AddStringToObject(root, "wifi_ssid", summary.wifi_ssid);
     cJSON_AddBoolToObject(root, "auth_enabled", config_store_web_auth_enabled());
     cJSON_AddBoolToObject(root, "sim_ready", modem.sim_ready);
     cJSON_AddBoolToObject(root, "network_registered", modem.registered);
@@ -418,10 +448,9 @@ static esp_err_t status_handler(httpd_req_t *request) {
     cJSON_AddNumberToObject(root, "modem_status_age", modem.age_seconds);
     cJSON_AddStringToObject(root, "operator", modem.operator_name);
     cJSON_AddStringToObject(root, "modem_model", modem.model);
-    cJSON_AddBoolToObject(root, "smtp_configured", config->smtp_server[0] != '\0' && config->smtp_recipient[0] != '\0');
-    cJSON_AddNumberToObject(root, "enabled_channels", channel_count);
+    cJSON_AddBoolToObject(root, "smtp_configured", summary.smtp_configured);
+    cJSON_AddNumberToObject(root, "enabled_channels", summary.enabled_channels);
     cJSON_AddNumberToObject(root, "uptime_seconds", (double)(esp_timer_get_time() / 1000000LL));
-    free(config);
     return send_json(request, 200, root);
 }
 
@@ -429,7 +458,6 @@ static esp_err_t status_handler(httpd_req_t *request) {
 static esp_err_t config_get_handler(httpd_req_t *request, const app_config_t *config) {
     cJSON *root = cJSON_CreateObject();
     cJSON *channels;
-    cJSON_AddStringToObject(root, "wifi_ssid", config->wifi_ssid);
     cJSON_AddStringToObject(root, "smtp_server", config->smtp_server);
     cJSON_AddNumberToObject(root, "smtp_port", config->smtp_port);
     cJSON_AddStringToObject(root, "smtp_user", config->smtp_user);
@@ -488,21 +516,12 @@ static bool update_channels(cJSON *json, app_config_t *config) {
 }
 
 /** @brief 读取或更新设备配置。 */
-static esp_err_t config_handler(httpd_req_t *request) {
-    app_config_t *config;
-    if (!authenticated(request, request->method == HTTP_POST)) {
-        return send_message(request, 401, "authentication or CSRF failed");
-    }
-    config = malloc(sizeof(*config));
-    if (config == NULL) return send_message(request, 500, "out of memory");
-    config_store_get(config);
+static esp_err_t config_handler_locked(httpd_req_t *request, app_config_t *config) {
     if (request->method == HTTP_GET) {
-        const esp_err_t result = config_get_handler(request, config);
-        free(config);
-        return result;
+        return config_get_handler(request, config);
     }
     cJSON *json = receive_json(request);
-    if (json == NULL) { free(config); return send_message(request, 400, "invalid JSON body"); }
+    if (json == NULL) return send_message(request, 400, "invalid JSON body");
     cJSON *password_item = cJSON_GetObjectItemCaseSensitive(json, "web_password");
     cJSON *auth_item = cJSON_GetObjectItemCaseSensitive(json, "web_auth_enabled");
     if (cJSON_IsBool(auth_item)) {
@@ -513,13 +532,11 @@ static esp_err_t config_handler(httpd_req_t *request) {
             else error = config_store_set_web_password(password_item->valuestring);
         }
         if (error == ESP_OK) error = config_store_set_web_auth_enabled(enable_auth);
-        cJSON_Delete(json); free(config);
+        cJSON_Delete(json);
         return error == ESP_OK ? send_message(request, 200, enable_auth ? "login protection enabled" : "login protection disabled")
                                : send_message(request, 400, "a new password of 10-72 characters is required");
     }
-    bool valid = update_string(json, "wifi_ssid", config->wifi_ssid, sizeof(config->wifi_ssid), false) &&
-                 update_string(json, "wifi_password", config->wifi_password, sizeof(config->wifi_password), true) &&
-                 update_string(json, "smtp_server", config->smtp_server, sizeof(config->smtp_server), false) &&
+    bool valid = update_string(json, "smtp_server", config->smtp_server, sizeof(config->smtp_server), false) &&
                  update_string(json, "smtp_user", config->smtp_user, sizeof(config->smtp_user), false) &&
                  update_string(json, "smtp_password", config->smtp_password, sizeof(config->smtp_password), true) &&
                  update_string(json, "smtp_recipient", config->smtp_recipient, sizeof(config->smtp_recipient), false) &&
@@ -535,12 +552,103 @@ static esp_err_t config_handler(httpd_req_t *request) {
     valid = valid && update_channels(json, config);
     cJSON_Delete(json);
     if (!valid || (config->smtp_port != 465U && config->smtp_port != 587U)) {
-        free(config); return send_message(request, 400, "configuration validation failed");
+        return send_message(request, 400, "configuration validation failed");
     }
     const esp_err_t error = config_store_save(config);
-    free(config);
     return error == ESP_OK ? send_message(request, 200, "configuration saved; reconnect Wi-Fi if credentials changed")
                            : send_message(request, 500, "failed to persist configuration");
+}
+
+/** @brief 串行访问固定配置快照，避免登录后的堆内存峰值。 */
+static esp_err_t config_handler(httpd_req_t *request) {
+    if (!authenticated(request, request->method == HTTP_POST)) {
+        return send_message(request, 401, "authentication or CSRF failed");
+    }
+    if (g_config_request_mutex == NULL ||
+        xSemaphoreTake(g_config_request_mutex, pdMS_TO_TICKS(5000U)) != pdTRUE) {
+        return send_message(request, 503, "configuration service busy");
+    }
+    config_store_get(&g_config_snapshot);
+    const esp_err_t result = config_handler_locked(request, &g_config_snapshot);
+    xSemaphoreGive(g_config_request_mutex);
+    return result;
+}
+
+/** @brief 返回或管理最多三组 Wi-Fi 凭据，从不返回明文密码。 */
+static esp_err_t wifi_profiles_handler(httpd_req_t *request) {
+    if (!authenticated(request, request->method == HTTP_POST)) {
+        return send_message(request, 401, "authentication or CSRF failed");
+    }
+    wifi_profile_t profiles[APP_MAX_WIFI_PROFILES];
+    uint8_t preferred = UINT8_MAX;
+    const size_t count = config_store_get_wifi_profiles(profiles, &preferred);
+    if (request->method == HTTP_GET) {
+        cJSON *root = cJSON_CreateObject();
+        cJSON *items = cJSON_AddArrayToObject(root, "profiles");
+        cJSON_AddNumberToObject(root, "capacity", APP_MAX_WIFI_PROFILES);
+        cJSON_AddNumberToObject(root, "count", count);
+        for (size_t slot = 0U; slot < APP_MAX_WIFI_PROFILES; ++slot) {
+            if (!profiles[slot].used) continue;
+            cJSON *item = cJSON_CreateObject();
+            cJSON_AddNumberToObject(item, "slot", slot);
+            cJSON_AddStringToObject(item, "ssid", profiles[slot].ssid);
+            cJSON_AddBoolToObject(item, "password_configured", profiles[slot].password[0] != '\0');
+            cJSON_AddBoolToObject(item, "preferred", preferred == slot);
+            cJSON_AddBoolToObject(item, "connected", wifi_service_active_slot() == (int)slot);
+            cJSON_AddItemToArray(items, item);
+        }
+        return send_json(request, 200, root);
+    }
+    cJSON *json = receive_json(request);
+    if (json == NULL) return send_message(request, 400, "invalid JSON body");
+    cJSON *action_item = cJSON_GetObjectItemCaseSensitive(json, "action");
+    cJSON *slot_item = cJSON_GetObjectItemCaseSensitive(json, "slot");
+    const char *action = cJSON_IsString(action_item) ? action_item->valuestring : NULL;
+    const int slot = cJSON_IsNumber(slot_item) ? slot_item->valueint : -1;
+    esp_err_t error = ESP_ERR_INVALID_ARG;
+    bool reconnect = false;
+    if (action != NULL && strcmp(action, "delete") == 0 && slot >= 0 &&
+        slot < (int)APP_MAX_WIFI_PROFILES && profiles[slot].used) {
+        reconnect = wifi_service_active_slot() == slot;
+        error = config_store_delete_wifi_profile((uint8_t)slot);
+    } else if (action != NULL && (strcmp(action, "add") == 0 || strcmp(action, "update") == 0 ||
+                                  strcmp(action, "replace") == 0)) {
+        char ssid[APP_WIFI_SSID_SIZE];
+        char password[APP_WIFI_PASSWORD_SIZE] = {0};
+        const bool update = strcmp(action, "update") == 0;
+        const bool replace = strcmp(action, "replace") == 0;
+        const bool valid_slot = slot >= 0 && slot < (int)APP_MAX_WIFI_PROFILES;
+        cJSON *password_item = cJSON_GetObjectItemCaseSensitive(json, "password");
+        cJSON *open_item = cJSON_GetObjectItemCaseSensitive(json, "open");
+        const bool open = cJSON_IsTrue(open_item);
+        const bool keep_password = update && !open && password_item == NULL;
+        int target_slot = (update || replace) ? slot : -1;
+        bool valid = json_string(json, "ssid", ssid, sizeof(ssid), true) &&
+                     (!update || (valid_slot && profiles[slot].used)) &&
+                     (!replace || valid_slot);
+        if (password_item != NULL && (!cJSON_IsString(password_item) || password_item->valuestring == NULL ||
+            strlen(password_item->valuestring) >= sizeof(password))) valid = false;
+        else if (cJSON_IsString(password_item)) snprintf(password, sizeof(password), "%s", password_item->valuestring);
+        if (!keep_password && !open && (password[0] == '\0' || strlen(password) < 8U)) valid = false;
+        for (size_t index = 0U; valid && index < APP_MAX_WIFI_PROFILES; ++index) {
+            if (profiles[index].used && strcmp(profiles[index].ssid, ssid) == 0) {
+                if (update && (int)index != slot) valid = false;
+                else if (!update && !replace) target_slot = (int)index;
+            }
+        }
+        if (valid) {
+            uint8_t saved_slot = UINT8_MAX;
+            error = config_store_save_wifi_profile(target_slot, ssid,
+                                                   open ? "" : password, keep_password, &saved_slot);
+        }
+    }
+    cJSON_Delete(json);
+    if (error != ESP_OK) {
+        return send_message(request, error == ESP_ERR_NO_MEM ? 409 : 400,
+                            error == ESP_ERR_NO_MEM ? "Wi-Fi profile capacity reached" : "invalid Wi-Fi profile request");
+    }
+    if (reconnect) wifi_service_reconnect();
+    return send_message(request, 200, "Wi-Fi profiles updated");
 }
 
 /** @brief 创建短信发送异步任务。 */
@@ -557,6 +665,17 @@ static esp_err_t sms_handler(httpd_req_t *request) {
     if (id == 0U) return send_message(request, 503, "modem queue unavailable");
     cJSON *root = cJSON_CreateObject(); cJSON_AddNumberToObject(root, "job_id", id);
     return send_json(request, 202, root);
+}
+
+/** @brief 把一条内部测试消息加入通知队列，不写入短信箱。 */
+static esp_err_t notification_test_handler(httpd_req_t *request) {
+    if (!authenticated(request, true)) {
+        return send_message(request, 401, "authentication or CSRF failed");
+    }
+    if (!notification_service_enqueue_test()) {
+        return send_message(request, 503, "notification queue unavailable");
+    }
+    return send_message(request, 202, "test notification queued");
 }
 
 /** @brief 返回按新到旧排列且可跨重启恢复的最近十条短信。 */
@@ -584,6 +703,36 @@ static esp_err_t inbox_handler(httpd_req_t *request) {
     if (error == ESP_OK) error = httpd_resp_send_chunk(request, "]}", 2U);
     if (error == ESP_OK) error = httpd_resp_send_chunk(request, NULL, 0U);
     return error;
+}
+
+/** @brief 按 ID 删除一条已持久化短信。 */
+static esp_err_t inbox_delete_handler(httpd_req_t *request) {
+    if (!authenticated(request, true)) return send_message(request, 401, "authentication or CSRF failed");
+    cJSON *json = receive_json(request);
+    if (json == NULL) return send_message(request, 400, "invalid JSON body");
+    cJSON *id_item = cJSON_GetObjectItemCaseSensitive(json, "id");
+    const uint32_t id = cJSON_IsNumber(id_item) && id_item->valuedouble > 0.0
+        ? (uint32_t)id_item->valuedouble : 0U;
+    cJSON_Delete(json);
+    if (id == 0U) return send_message(request, 400, "invalid message id");
+    return sms_service_inbox_delete(id) ? send_message(request, 200, "message deleted")
+                                        : send_message(request, 404, "message not found");
+}
+
+/** @brief 把收件箱中指定短信重新加入通知队列。 */
+static esp_err_t inbox_forward_handler(httpd_req_t *request) {
+    if (!authenticated(request, true)) return send_message(request, 401, "authentication or CSRF failed");
+    cJSON *json = receive_json(request);
+    if (json == NULL) return send_message(request, 400, "invalid JSON body");
+    cJSON *id_item = cJSON_GetObjectItemCaseSensitive(json, "id");
+    const uint32_t id = cJSON_IsNumber(id_item) && id_item->valuedouble > 0.0
+        ? (uint32_t)id_item->valuedouble : 0U;
+    cJSON_Delete(json);
+    sms_inbox_entry_t entry;
+    if (!sms_service_inbox_find(id, &entry)) return send_message(request, 404, "message not found");
+    return notification_service_enqueue_inbox(id)
+        ? send_message(request, 202, "message queued for forwarding")
+        : send_message(request, 503, "notification queue unavailable");
 }
 
 /** @brief 创建只读 AT 查询异步任务。 */
@@ -629,12 +778,25 @@ static esp_err_t system_restart_handler(httpd_req_t *request) {
     return ESP_OK;
 }
 
-/** @brief 鉴权后触发 Wi-Fi STA 重连。 */
+/** @brief 等待 HTTP 应答发送完成后再执行 Wi-Fi STA 重连。 */
+static void delayed_wifi_reconnect(void *argument) {
+    (void)argument;
+    vTaskDelay(pdMS_TO_TICKS(750U));
+    const esp_err_t error = wifi_service_reconnect();
+    if (error != ESP_OK) ESP_LOGW(g_tag, "delayed Wi-Fi reconnect failed: %s", esp_err_to_name(error));
+    vTaskDelete(NULL);
+}
+
+/** @brief 鉴权后安排 Wi-Fi STA 重连。 */
 static esp_err_t wifi_reconnect_handler(httpd_req_t *request) {
     if (!authenticated(request, true)) return send_message(request, 401, "authentication or CSRF failed");
-    return wifi_service_reconnect() == ESP_OK
-        ? send_message(request, 202, "Wi-Fi reconnect started")
-        : send_message(request, 409, "cannot reconnect while provisioning");
+    if (wifi_service_provisioning()) {
+        return send_message(request, 409, "cannot reconnect while provisioning");
+    }
+    if (xTaskCreate(delayed_wifi_reconnect, "wifi_reconnect", 2048U, NULL, 5U, NULL) != pdPASS) {
+        return send_message(request, 503, "cannot schedule Wi-Fi reconnect");
+    }
+    return send_message(request, 202, "Wi-Fi reconnect scheduled");
 }
 
 /** @brief 返回日志环形缓冲区内容。 */
@@ -676,7 +838,12 @@ static const web_route_t g_routes[] = {
     {"/api/session", HTTP_DELETE, logout_handler},
     {"/api/status", HTTP_GET, status_handler}, {"/api/config", HTTP_GET, config_handler},
     {"/api/config", HTTP_POST, config_handler}, {"/api/sms", HTTP_POST, sms_handler},
+    {"/api/notifications/test", HTTP_POST, notification_test_handler},
     {"/api/inbox", HTTP_GET, inbox_handler},
+    {"/api/inbox/delete", HTTP_POST, inbox_delete_handler},
+    {"/api/inbox/forward", HTTP_POST, inbox_forward_handler},
+    {"/api/wifi/profiles", HTTP_GET, wifi_profiles_handler},
+    {"/api/wifi/profiles", HTTP_POST, wifi_profiles_handler},
     {"/api/at/query", HTTP_POST, at_handler}, {"/api/modem/restart", HTTP_POST, modem_restart_handler},
     {"/api/system/restart", HTTP_POST, system_restart_handler},
     {"/api/wifi/reconnect", HTTP_POST, wifi_reconnect_handler}, {"/api/logs", HTTP_GET, logs_handler},
@@ -686,12 +853,15 @@ esp_err_t web_server_start(void) {
     if (g_server != NULL) return ESP_OK;
     g_session_mutex = xSemaphoreCreateMutex();
     g_log_mutex = xSemaphoreCreateMutex();
-    if (g_session_mutex == NULL || g_log_mutex == NULL) return ESP_ERR_NO_MEM;
+    g_config_request_mutex = xSemaphoreCreateMutex();
+    if (g_session_mutex == NULL || g_log_mutex == NULL || g_config_request_mutex == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
     g_previous_vprintf = esp_log_set_vprintf(capture_vprintf);
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 12288U;
     config.max_uri_handlers = sizeof(g_routes) / sizeof(g_routes[0]) + 2U;
-    config.max_open_sockets = 13;
+    config.max_open_sockets = 8;
     config.lru_purge_enable = true;
     config.uri_match_fn = httpd_uri_match_wildcard;
     /* 门户探测会制造大量预期内的未匹配 URI，不需要在串口重复报警。 */

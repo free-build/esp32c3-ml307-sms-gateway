@@ -25,27 +25,44 @@ static void test_safety_policy(void) {
     assert(safety_is_read_only_at_command("AT+ICCID"));
     assert(safety_is_read_only_at_command("AT+CGACT?"));
     assert(safety_is_read_only_at_command("AT+CPIN?"));
+    assert(safety_is_read_only_at_command("AT+MDIALUPCFG?"));
+    assert(safety_is_read_only_at_command("AT+MDIALUP?"));
+    assert(safety_is_read_only_at_command("AT+MIPCALL?"));
+    assert(safety_is_read_only_at_command("AT+CMGF?"));
+    assert(safety_is_read_only_at_command("AT+CNMI?"));
+    assert(safety_is_read_only_at_command("AT+CPMS?"));
+    assert(safety_is_read_only_at_command("AT+CMGL=4"));
+    assert(safety_is_read_only_at_command("AT+CSCA?"));
     assert(!safety_is_read_only_at_command("AT+CFUN=1,1"));
     assert(!safety_is_read_only_at_command("AT+CMGF=0"));
     assert(safety_is_pdp_deactivation_command("AT+CGACT=0,1"));
+    assert(safety_is_safe_at_command("AT+CGACT=0,1"));
+    assert(safety_is_safe_at_command("AT+MIPCALL=0,1"));
+    assert(safety_is_safe_at_command("AT+MUECONFIG=\"autoconn\",0"));
+    assert(safety_is_safe_at_command("AT+MDIALUPCFG=\"auto\",0"));
+    assert(safety_is_safe_at_command("AT+CPMS=\"SM\",\"SM\",\"SM\""));
+    assert(safety_is_safe_at_command("AT+CNMI=2,1,0,0,0"));
+    assert(!safety_is_safe_at_command("AT+MUECONFIG=\"autoconn\",1"));
+    assert(!safety_is_safe_at_command("AT+MDIALUPCFG=\"auto\",1"));
+    assert(!safety_is_read_only_at_command("AT+MUECONFIG=\"autoconn\",0"));
+    assert(!safety_is_forbidden_cellular_data_command("AT+MIPCALL=0,1"));
     assert(safety_is_pdp_deactivation_command(" at + cgact = 0, 16 "));
     assert(!safety_is_pdp_deactivation_command("AT+CGACT=1,1"));
     assert(!safety_is_pdp_deactivation_command("AT+CGACT=0,0"));
     assert(!safety_is_pdp_deactivation_command("AT+CGACT=0,1;+CGACT=1,1"));
-    int active[8];
-    size_t count = 0U;
-    assert(safety_parse_active_pdp_contexts("+CGACT: 1,0\n+CGACT: 2,1\n", active, 8U, &count));
-    assert(count == 1U && active[0] == 2);
-    assert(safety_parse_active_pdp_contexts("+CGACT:3,0\n", active, 8U, &count));
-    assert(count == 0U);
+    assert(safety_is_sms_delete_command("AT+CMGD=1"));
+    assert(safety_is_safe_at_command("AT+CMGD=1"));
+    assert(safety_is_sms_delete_command(" at + cmgd = 50 "));
+    assert(!safety_is_sms_delete_command("AT+CMGD=0"));
+    assert(!safety_is_sms_delete_command("AT+CMGD=1,4"));
+    assert(!safety_is_read_only_at_command("AT+CMGD=1"));
     bool cid_active = true;
     assert(safety_pdp_context_is_active("+CGACT: 1,0\n+CGACT: 8,1\nOK\n", 1, &cid_active));
     assert(!cid_active); /* 兼容 ML307：CID 8 活动不影响短信业务。 */
     assert(safety_pdp_context_is_active("+CGACT: 1,1\n+CGACT: 8,1\nOK\n", 1, &cid_active));
     assert(cid_active);
     assert(!safety_pdp_context_is_active("+CGACT: invalid\n", 1, &cid_active));
-    assert(!safety_parse_active_pdp_contexts("OK\n", active, 8U, &count));
-    assert(!safety_parse_active_pdp_contexts("+CGACT: invalid\n", active, 8U, &count));
+    assert(!safety_pdp_context_is_active("OK\n", 1, &cid_active));
 }
 
 /** @brief 验证 C 接口输出的 PDU 终止符及长短信参数。 */

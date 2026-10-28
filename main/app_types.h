@@ -16,6 +16,8 @@
 #define APP_WIFI_SSID_SIZE 33U
 /** Wi-Fi 密码缓冲区长度，包含字符串结束符。 */
 #define APP_WIFI_PASSWORD_SIZE 64U
+/** 可保存的 Wi-Fi 凭据数量。 */
+#define APP_MAX_WIFI_PROFILES 3U
 /** SMTP 主机名缓冲区长度。 */
 #define APP_SMTP_HOST_SIZE 128U
 /** SMTP 用户名、密码及收件地址缓冲区长度。 */
@@ -65,11 +67,18 @@ typedef struct {
     char custom_body[APP_CHANNEL_BODY_SIZE];
 } push_channel_t;
 
+/** 一组持久化 Wi-Fi 凭据。 */
+typedef struct {
+    bool used;
+    char ssid[APP_WIFI_SSID_SIZE];
+    char password[APP_WIFI_PASSWORD_SIZE];
+} wifi_profile_t;
+
 /** 应用的完整持久化配置。 */
 typedef struct {
     uint32_t schema_version;
-    char wifi_ssid[APP_WIFI_SSID_SIZE];
-    char wifi_password[APP_WIFI_PASSWORD_SIZE];
+    wifi_profile_t wifi_profiles[APP_MAX_WIFI_PROFILES];
+    uint8_t last_successful_wifi;
     char smtp_server[APP_SMTP_HOST_SIZE];
     uint16_t smtp_port;
     char smtp_user[APP_SMTP_FIELD_SIZE];

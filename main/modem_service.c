@@ -38,6 +38,10 @@
 #define MODEM_DATA_GUARD_TICKS pdMS_TO_TICKS(60000U)
 /** 首页蜂窝状态缓存刷新间隔。 */
 #define MODEM_STATUS_REFRESH_TICKS pdMS_TO_TICKS(30000U)
+/** 旧版 ML307 未发送 +CMT 时，轮询 SIM 短信存储的间隔。 */
+#define MODEM_SMS_STORAGE_SCAN_TICKS pdMS_TO_TICKS(10000U)
+/** SIM 短信存储槽上限。 */
+#define MODEM_SMS_STORAGE_CAPACITY 50U
 /** 保存的异步任务状态数量。 */
 #define MODEM_JOB_CAPACITY 32U
 /** 内部命令参数缓冲区长度。 */
@@ -87,6 +91,8 @@ static job_status_t g_jobs[MODEM_JOB_CAPACITY];
 static size_t g_next_job_slot;
 /** 是否正在等待 +CMT 后的 PDU 行。 */
 static bool g_waiting_for_pdu;
+/** 收到 +CMTI 后请求主循环立即扫描短信存储。 */
+static atomic_bool g_sms_scan_requested;
 /** 跨调用保存的 UART 行缓冲区。 */
 static char g_uart_line[MODEM_MAX_RESPONSE + 1U];
 /** UART 行缓冲区当前长度。 */
@@ -242,13 +248,13 @@ static bool read_line(char *output, size_t output_size, uint32_t timeout_ms) {
 }
 
 /** @brief 解码一行 PDU 并提交给短信处理服务。 */
-static void handle_pdu_line(const char *line) {
+static bool handle_pdu_line(const char *line) {
     decoded_sms_t sms = {0};
-    if (line == NULL || line[0] == '\0') return;
+    if (line == NULL || line[0] == '\0') return false;
     for (const char *cursor = line; *cursor != '\0'; ++cursor) {
         if (!isxdigit((unsigned char)*cursor)) {
             ESP_LOGW(g_tag, "invalid PDU line rejected");
-            return;
+            return false;
         }
     }
     if (!pdu_c_decode(line, sms.message.sender, sizeof(sms.message.sender), sms.message.text,
@@ -256,17 +262,36 @@ static void handle_pdu_line(const char *line) {
                       sizeof(sms.message.timestamp), &sms.concat_reference, &sms.part_number,
                       &sms.total_parts)) {
         ESP_LOGE(g_tag, "PDU decode failed or overflowed");
-        return;
+        return false;
     }
-    sms_service_enqueue(&sms);
+    /* 某些固件会同时直接上报并保存同一条短信，避免重复入箱。 */
+    const size_t inbox_count = sms_service_inbox_count();
+    for (size_t index = 0U; index < inbox_count; ++index) {
+        sms_inbox_entry_t existing;
+        if (sms_service_inbox_get(index, &existing) &&
+            strcmp(existing.message.sender, sms.message.sender) == 0 &&
+            strcmp(existing.message.timestamp, sms.message.timestamp) == 0 &&
+            strcmp(existing.message.text, sms.message.text) == 0) {
+            ESP_LOGI(g_tag, "duplicate stored SMS skipped (timestamp=%s)",
+                     sms.message.timestamp);
+            return true;
+        }
+    }
+    ESP_LOGI(g_tag, "decoded SMS queued (timestamp=%s, part=%u/%u)",
+             sms.message.timestamp, (unsigned)sms.part_number,
+             (unsigned)sms.total_parts);
+    return sms_service_enqueue(&sms);
 }
 
 /** @brief 处理模组主动上报的单行数据。 */
 static void handle_line(const char *line) {
     if (strncmp(line, "+CMT:", 5U) == 0) {
         g_waiting_for_pdu = true;
+    } else if (strncmp(line, "+CMTI:", 6U) == 0) {
+        ESP_LOGI(g_tag, "stored SMS notification: %s", line);
+        atomic_store(&g_sms_scan_requested, true);
     } else if (g_waiting_for_pdu) {
-        handle_pdu_line(line);
+        (void)handle_pdu_line(line);
         g_waiting_for_pdu = false;
     }
 }
@@ -275,7 +300,7 @@ static void handle_line(const char *line) {
 static bool send_at(const char *command, uint32_t timeout_ms, char *response, size_t response_size) {
     char wire[192];
     const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
-    if (!safety_is_pdp_deactivation_command(command) && !safety_is_safe_at_command(command)) {
+    if (!safety_is_safe_at_command(command)) {
         snprintf(response, response_size, "blocked by cellular-data safety policy");
         ESP_LOGE(g_tag, "blocked unsafe AT command");
         return false;
@@ -294,8 +319,12 @@ static bool send_at(const char *command, uint32_t timeout_ms, char *response, si
             return false;
         }
         if (strncmp(g_modem_work_line, "+CMT:", 5U) == 0) { g_waiting_for_pdu = true; continue; }
+        if (strncmp(g_modem_work_line, "+CMTI:", 6U) == 0) {
+            atomic_store(&g_sms_scan_requested, true);
+            continue;
+        }
         if (g_waiting_for_pdu) {
-            handle_pdu_line(g_modem_work_line);
+            (void)handle_pdu_line(g_modem_work_line);
             g_waiting_for_pdu = false;
             continue;
         }
@@ -349,37 +378,142 @@ static bool power_cycle(void) {
     return true;
 }
 
-/** @brief 仅确认并关闭应用数据 CID 1；模组内部 CID 由模组自行维护。 */
-static bool enforce_data_disabled(void) {
-    bool cid1_active = false;
-    bool safe = send_at("AT+CGACT?", 3000U, g_modem_response, sizeof(g_modem_response)) &&
-                safety_pdp_context_is_active(g_modem_response, 1, &cid1_active);
-    if (safe && cid1_active) {
-        safe = send_at("AT+CGACT=0,1", 5000U, g_modem_response, sizeof(g_modem_response));
+/** @brief 查询 CID 1；旧版固件仅返回 OK 时表示当前没有活动上下文。 */
+static bool query_cid1_state(bool *cid1_active) {
+    if (!send_at("AT+CGACT?", 3000U, g_modem_response, sizeof(g_modem_response))) return false;
+    if (g_modem_response[0] == '\0') {
+        *cid1_active = false;
+        return true;
     }
-    cid1_active = true;
-    safe = safe && send_at("AT+CGACT?", 3000U, g_modem_response, sizeof(g_modem_response)) &&
-           safety_pdp_context_is_active(g_modem_response, 1, &cid1_active) && !cid1_active;
+    return safety_pdp_context_is_active(g_modem_response, 1, cid1_active);
+}
+
+/**
+ * @brief 持久关闭只会拉起 CID 1 的模组应用自动联网与主机自动拨号。
+ *
+ * 两条指令都是精确的禁用值，已加入内部安全白名单，但不对 Web AT
+ * 查询接口开放。旧版固件若不支持，则由 CID 1 状态机继续兜底。
+ */
+static void disable_cid1_auto_dial(void) {
+    if (!send_at("AT+MUECONFIG=\"autoconn\",0", 3000U,
+                 g_modem_response, sizeof(g_modem_response))) {
+        ESP_LOGW(g_tag, "application auto-connect setting was not accepted: %s",
+                 g_modem_response[0] != '\0' ? g_modem_response : "<empty>");
+    } else {
+        ESP_LOGI(g_tag, "application auto-connect disabled");
+    }
+    if (!send_at("AT+MDIALUPCFG=\"auto\",0", 3000U,
+                 g_modem_response, sizeof(g_modem_response))) {
+        ESP_LOGW(g_tag, "host auto-dial setting was not accepted: %s",
+                 g_modem_response[0] != '\0' ? g_modem_response : "<empty>");
+    } else {
+        ESP_LOGI(g_tag, "host auto-dial disabled");
+    }
+}
+
+/** @brief 仅确认并关闭应用数据 CID 1；模组内部 CID 由模组自行维护。 */
+static bool enforce_data_disabled(bool *closed_cid1) {
+    static const unsigned maximum_attempts = 6U;
+    bool closed_active_cid1 = false;
+    bool safe = false;
+    for (unsigned attempt = 1U; attempt <= maximum_attempts; ++attempt) {
+        bool cid1_active = true;
+        safe = query_cid1_state(&cid1_active);
+        if (safe && !cid1_active) break;
+        if (safe) {
+            closed_active_cid1 = true;
+            ESP_LOGW(g_tag, "CID 1 active; shutdown attempt %u/%u", attempt, maximum_attempts);
+            (void)send_at("AT+MIPCALL=0,1", 5000U,
+                          g_modem_response, sizeof(g_modem_response));
+            (void)send_at("AT+CGACT=0,1", 5000U,
+                          g_modem_response, sizeof(g_modem_response));
+        }
+        ESP_LOGW(g_tag, "CID 1 shutdown attempt %u/%u not yet stable: %s",
+                 attempt, maximum_attempts,
+                 g_modem_response[0] != '\0' ? g_modem_response : "<empty>");
+        if (attempt < maximum_attempts) vTaskDelay(pdMS_TO_TICKS(2000U));
+    }
     atomic_store(&g_data_disabled, safe);
+    if (closed_cid1 != NULL) *closed_cid1 = closed_active_cid1 && safe;
     if (!safe) {
         ESP_LOGW(g_tag, "CID 1 verification response: %s",
                  g_modem_response[0] != '\0' ? g_modem_response : "<empty>");
         ESP_LOGE(g_tag, "cannot prove PDP CID 1 is inactive; powering the modem off");
         gpio_set_level(MODEM_ENABLE_PIN, 0);
         atomic_store(&g_ready, false);
-    } else {
+    } else if (closed_active_cid1) {
         ESP_LOGI(g_tag, "PDP CID 1 is inactive; modem-managed CIDs are left unchanged");
     }
     return safe;
 }
 
-/** @brief 启动模组、应用安全策略并配置短信 PDU 上报。 */
-static bool initialize_modem(void) {
+/** @brief 在驻网和 CID 安全处理完成后配置 PDU 短信直接上报。 */
+static bool configure_sms_reception(void) {
+    if (!send_at("AT+CMGF=0", 2000U, g_modem_response, sizeof(g_modem_response))) {
+        ESP_LOGW(g_tag, "cannot select SMS PDU mode: %s",
+                 g_modem_response[0] != '\0' ? g_modem_response : "<empty>");
+        return false;
+    }
+    if (!send_at("AT+CPMS=\"SM\",\"SM\",\"SM\"", 3000U,
+                 g_modem_response, sizeof(g_modem_response))) {
+        ESP_LOGW(g_tag, "cannot select SIM SMS storage: %s",
+                 g_modem_response[0] != '\0' ? g_modem_response : "<empty>");
+        return false;
+    }
+    if (!send_at("AT+CNMI=2,1,0,0,0", 2000U, g_modem_response, sizeof(g_modem_response))) {
+        ESP_LOGW(g_tag, "cannot enable stored SMS notifications: %s",
+                 g_modem_response[0] != '\0' ? g_modem_response : "<empty>");
+        return false;
+    }
+    ESP_LOGI(g_tag, "SMS PDU storage and +CMTI notification configured");
+    return true;
+}
+
+/** @brief 导入旧版模组未通过 +CMT 直接上报、而保存到 SIM 的短信。 */
+static bool import_stored_sms(void) {
+    int decoded_slots[MODEM_SMS_STORAGE_CAPACITY];
+    size_t decoded_count = 0U;
+    int pending_slot = -1;
+    if (!send_at("AT+CMGL=4", 10000U, g_modem_response, sizeof(g_modem_response))) {
+        ESP_LOGW(g_tag, "cannot scan stored SMS: %s",
+                 g_modem_response[0] != '\0' ? g_modem_response : "<empty>");
+        return false;
+    }
+    char *save = NULL;
+    char *line = strtok_r(g_modem_response, "\n", &save);
+    while (line != NULL) {
+        int slot = -1;
+        if (sscanf(line, "+CMGL: %d", &slot) == 1 && slot > 0 && slot <= 255) {
+            pending_slot = slot;
+        } else if (pending_slot > 0) {
+            if (handle_pdu_line(line) && decoded_count < MODEM_SMS_STORAGE_CAPACITY) {
+                decoded_slots[decoded_count++] = pending_slot;
+            }
+            pending_slot = -1;
+        }
+        line = strtok_r(NULL, "\n", &save);
+    }
+    for (size_t index = 0U; index < decoded_count; ++index) {
+        char command[24];
+        snprintf(command, sizeof(command), "AT+CMGD=%d", decoded_slots[index]);
+        if (!send_at(command, 3000U, g_modem_response, sizeof(g_modem_response))) {
+            ESP_LOGW(g_tag, "cannot delete imported SMS slot %d: %s", decoded_slots[index],
+                     g_modem_response[0] != '\0' ? g_modem_response : "<empty>");
+        }
+    }
+    if (decoded_count > 0U) {
+        ESP_LOGI(g_tag, "imported %u stored SMS message(s)", (unsigned)decoded_count);
+    }
+    return true;
+}
+
+/** @brief 启动或重新同步模组、应用安全策略并配置短信 PDU 上报。 */
+static bool initialize_modem(bool cycle_power) {
     bool responsive = false;
     bool registered = false;
     atomic_store(&g_ready, false);
     atomic_store(&g_data_disabled, false);
-    if (!power_cycle()) return false;
+    if (cycle_power && !power_cycle()) return false;
     for (int attempt = 0; attempt < 10 && !responsive; ++attempt) {
         responsive = send_at("AT", 1000U, g_modem_response, sizeof(g_modem_response));
         if (!responsive) vTaskDelay(pdMS_TO_TICKS(500U));
@@ -395,9 +529,8 @@ static bool initialize_modem(void) {
         snprintf(g_model, sizeof(g_model), "%.*s", (int)sizeof(g_model) - 1, g_modem_response);
         xSemaphoreGive(g_state_mutex);
     }
-    if (!enforce_data_disabled()) return false;
-    if (!send_at("AT+CNMI=2,2,0,0,0", 2000U, g_modem_response, sizeof(g_modem_response))) return false;
-    if (!send_at("AT+CMGF=0", 2000U, g_modem_response, sizeof(g_modem_response))) return false;
+    disable_cid1_auto_dial();
+    if (!enforce_data_disabled(NULL)) return false;
     for (int attempt = 0; attempt < 30; ++attempt) {
         if (send_at("AT+CEREG?", 2000U, g_modem_response, sizeof(g_modem_response)) &&
             (strstr(g_modem_response, ",1") != NULL || strstr(g_modem_response, ",5") != NULL)) {
@@ -407,7 +540,12 @@ static bool initialize_modem(void) {
         vTaskDelay(pdMS_TO_TICKS(500U));
     }
     if (!registered) ESP_LOGW(g_tag, "network registration timed out; receive service remains degraded");
+    /* 驻网过程可能新建默认 CID 1，对最终网络状态再做一次强制核验。 */
+    if (!enforce_data_disabled(NULL)) return false;
+    if (!configure_sms_reception()) return false;
+    if (!import_stored_sms()) return false;
     ESP_LOGI(g_tag, "modem initialized; application data CID 1 is confirmed inactive");
+    atomic_store(&g_ready, true);
     return true;
 }
 
@@ -495,12 +633,28 @@ static bool execute_command(const modem_command_t *command, char *result, size_t
         case MODEM_COMMAND_SEND_SMS:
             return send_sms(command->arg1, command->arg2, result, result_size);
         case MODEM_COMMAND_SOFT_RESET: {
-            bool ok = send_at("AT+CFUN=1,1", 15000U, result, result_size);
-            if (ok) { vTaskDelay(pdMS_TO_TICKS(6000U)); ok = initialize_modem(); }
+            /* 部分 ML307 固件在重启前不返回终结 OK，不能以此判定失败。 */
+            (void)send_at("AT+CFUN=1,1", 15000U, result, result_size);
+            vTaskDelay(pdMS_TO_TICKS(8000U));
+            bool ok = initialize_modem(false);
+            bool hardware_fallback = false;
+            if (!ok) {
+                ESP_LOGW(g_tag, "soft restart recovery failed; trying hardware power-cycle fallback");
+                hardware_fallback = true;
+                ok = initialize_modem(true);
+            }
+            snprintf(result, result_size, "%s",
+                     ok ? (hardware_fallback ? "soft restart recovered with hardware fallback"
+                                             : "modem soft restart completed")
+                        : "modem restart failed after hardware fallback");
             return ok;
         }
-        case MODEM_COMMAND_HARD_RESET:
-            return initialize_modem();
+        case MODEM_COMMAND_HARD_RESET: {
+            const bool ok = initialize_modem(true);
+            snprintf(result, result_size, "%s", ok ? "modem hard restart completed"
+                                                     : "modem hard restart failed");
+            return ok;
+        }
         default:
             return false;
     }
@@ -510,15 +664,18 @@ static bool execute_command(const modem_command_t *command, char *result, size_t
 static void modem_task(void *argument) {
     TickType_t last_data_guard;
     TickType_t last_status_refresh;
+    TickType_t last_sms_storage_scan;
     (void)argument;
-    atomic_store(&g_ready, initialize_modem());
+    ESP_LOGI(g_tag, "power-cycling modem before SMS initialization");
+    atomic_store(&g_ready, initialize_modem(true));
     last_data_guard = xTaskGetTickCount();
     refresh_status();
     last_status_refresh = xTaskGetTickCount();
+    last_sms_storage_scan = last_status_refresh;
     while (true) {
         modem_command_t *command = NULL;
         if (xQueueReceive(g_command_queue, &command, pdMS_TO_TICKS(20U)) == pdTRUE) {
-            char result[APP_JOB_MESSAGE_SIZE];
+            char result[APP_JOB_MESSAGE_SIZE] = {0};
             update_job(command->id, JOB_STATE_RUNNING, "running");
             const bool ok = execute_command(command, result, sizeof(result));
             update_job(command->id, ok ? JOB_STATE_SUCCEEDED : JOB_STATE_FAILED, result);
@@ -526,13 +683,26 @@ static void modem_task(void *argument) {
         }
         if (read_line(g_modem_work_line, sizeof(g_modem_work_line), 10U)) handle_line(g_modem_work_line);
         const TickType_t now = xTaskGetTickCount();
+        if (modem_service_ready() && atomic_exchange(&g_sms_scan_requested, false)) {
+            (void)import_stored_sms();
+            last_sms_storage_scan = xTaskGetTickCount();
+        }
         if (modem_service_ready() && now - last_data_guard >= MODEM_DATA_GUARD_TICKS) {
-            if (!enforce_data_disabled()) atomic_store(&g_ready, false);
+            bool closed_cid1 = false;
+            if (!enforce_data_disabled(&closed_cid1) ||
+                (closed_cid1 && !configure_sms_reception())) {
+                atomic_store(&g_ready, false);
+            }
             last_data_guard = now;
         }
         if (now - last_status_refresh >= MODEM_STATUS_REFRESH_TICKS) {
             refresh_status();
             last_status_refresh = xTaskGetTickCount();
+        }
+        if (modem_service_ready() &&
+            now - last_sms_storage_scan >= MODEM_SMS_STORAGE_SCAN_TICKS) {
+            (void)import_stored_sms();
+            last_sms_storage_scan = xTaskGetTickCount();
         }
     }
 }

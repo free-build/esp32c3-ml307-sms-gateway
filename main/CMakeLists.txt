@@ -27,8 +27,9 @@ idf_component_register(
         nvs_flash
         pdulib
         spiffs
-    EMBED_TXTFILES
-        "web/management.html"
+    EMBED_FILES
+        "web/management.html.gz"
+        "web/provision.html"
 )
 
 target_compile_features(${COMPONENT_LIB} PRIVATE c_std_11)

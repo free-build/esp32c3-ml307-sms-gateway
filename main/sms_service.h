@@ -40,3 +40,9 @@ size_t sms_service_inbox_count(void);
 
 /** @brief 按新到旧顺序读取指定位置的一条短信。 */
 bool sms_service_inbox_get(size_t newest_index, sms_inbox_entry_t *entry);
+
+/** @brief 按持久化 ID 读取一条短信。 */
+bool sms_service_inbox_find(uint32_t id, sms_inbox_entry_t *entry);
+
+/** @brief 按持久化 ID 删除一条短信。 */
+bool sms_service_inbox_delete(uint32_t id);

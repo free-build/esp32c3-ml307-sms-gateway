@@ -11,6 +11,7 @@
 #include "mbedtls/base64.h"
 #include "mbedtls/md.h"
 #include "smtp_client.h"
+#include "sms_service.h"
 #include "wifi_service.h"
 
 #include <ctype.h>
@@ -23,7 +24,7 @@
 /** 通知队列深度。 */
 #define NOTIFY_QUEUE_DEPTH 16U
 /** HTTP 响应正文最大长度。 */
-#define NOTIFY_MAX_RESPONSE 4096U
+#define NOTIFY_MAX_RESPONSE 1024U
 /** HTTP 请求最多重试次数。 */
 #define NOTIFY_MAX_ATTEMPTS 3U
 
@@ -37,6 +38,16 @@ typedef struct {
 static const char *const g_tag = "notify";
 /** 待投递短信指针队列。 */
 static QueueHandle_t g_notify_queue;
+
+/** @brief 等待 Wi-Fi 拿到 IP，避免短暂重连期间直接丢弃通知。 */
+static bool wait_for_wifi(uint32_t timeout_ms) {
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() < deadline) {
+        if (wifi_service_connected()) return true;
+        vTaskDelay(pdMS_TO_TICKS(250U));
+    }
+    return wifi_service_connected();
+}
 
 /** @brief 按 printf 格式分配精确长度的字符串。 */
 static char *format_alloc(const char *format, ...) {
@@ -334,34 +345,56 @@ static bool send_channel(const push_channel_t *channel, const sms_message_t *sms
 static void notification_task(void *argument) {
     (void)argument;
     while (true) {
-        sms_message_t *sms = NULL;
-        if (xQueueReceive(g_notify_queue, &sms, portMAX_DELAY) != pdTRUE || sms == NULL) continue;
-        if (!wifi_service_connected()) {
-            ESP_LOGW(g_tag, "Wi-Fi offline; notification cannot be delivered");
-            free(sms);
+        uint32_t inbox_id = 0U;
+        sms_message_t sms;
+        if (xQueueReceive(g_notify_queue, &inbox_id, portMAX_DELAY) != pdTRUE) continue;
+        if (inbox_id == 0U) {
+            memset(&sms, 0, sizeof(sms));
+            snprintf(sms.sender, sizeof(sms.sender), "SMS-GATEWAY");
+            snprintf(sms.text, sizeof(sms.text), "ESP32-C3 SMS gateway notification test");
+            snprintf(sms.timestamp, sizeof(sms.timestamp), "manual-test");
+        } else {
+            sms_inbox_entry_t entry;
+            if (!sms_service_inbox_find(inbox_id, &entry)) {
+                ESP_LOGW(g_tag, "inbox id %lu no longer exists; notification skipped",
+                         (unsigned long)inbox_id);
+                continue;
+            }
+            memcpy(&sms, &entry.message, sizeof(sms));
+        }
+        /* 等待收件箱持久化和 SIM 槽清理释放临时内存，再启动 TLS 验签。 */
+        vTaskDelay(pdMS_TO_TICKS(750U));
+        if (!wait_for_wifi(30000U)) {
+            ESP_LOGW(g_tag, "Wi-Fi remained offline; notification cannot be delivered");
             continue;
         }
-        app_config_t *config = malloc(sizeof(*config));
-        if (config == NULL) { free(sms); continue; }
-        config_store_get(config);
         for (size_t index = 0U; index < APP_MAX_PUSH_CHANNELS; ++index) {
-            if (config->push_channels[index].enabled) send_channel(&config->push_channels[index], sms);
+            push_channel_t channel;
+            if (config_store_get_push_channel(index, &channel) && channel.enabled) {
+                send_channel(&channel, &sms);
+            }
         }
+        config_smtp_settings_t settings;
+        config_store_get_smtp_settings(&settings);
         smtp_client_config_t smtp = {0};
-        snprintf(smtp.server, sizeof(smtp.server), "%s", config->smtp_server);
-        smtp.port = config->smtp_port;
-        snprintf(smtp.user, sizeof(smtp.user), "%s", config->smtp_user);
-        snprintf(smtp.password, sizeof(smtp.password), "%s", config->smtp_password);
-        snprintf(smtp.recipient, sizeof(smtp.recipient), "%s", config->smtp_recipient);
-        free(config);
+        snprintf(smtp.server, sizeof(smtp.server), "%s", settings.server);
+        smtp.port = settings.port;
+        snprintf(smtp.user, sizeof(smtp.user), "%s", settings.user);
+        snprintf(smtp.password, sizeof(smtp.password), "%s", settings.password);
+        snprintf(smtp.recipient, sizeof(smtp.recipient), "%s", settings.recipient);
+        memset(&settings, 0, sizeof(settings));
         if (smtp.server[0] != '\0') {
-            char error[APP_JOB_MESSAGE_SIZE];
+            char error[APP_JOB_MESSAGE_SIZE] = "SMTP delivery not attempted";
             char subject[APP_PHONE_SIZE + 16U];
-            char *body = format_alloc("From: %s\nTime: %s\n\n%s", sms->sender, sms->timestamp, sms->text);
+            char *body = format_alloc("From: %s\nTime: %s\n\n%s", sms.sender, sms.timestamp, sms.text);
             bool sent = false;
-            snprintf(subject, sizeof(subject), "SMS from %s", sms->sender);
-            for (unsigned attempt = 0U; attempt < 3U && !sent; ++attempt) {
-                if (attempt > 0U) vTaskDelay(pdMS_TO_TICKS(1000U << (attempt - 1U)));
+            snprintf(subject, sizeof(subject), "SMS from %s", sms.sender);
+            for (unsigned attempt = 0U; attempt < 5U && !sent; ++attempt) {
+                if (attempt > 0U) vTaskDelay(pdMS_TO_TICKS(2000U << (attempt - 1U)));
+                if (!wait_for_wifi(30000U)) {
+                    snprintf(error, sizeof(error), "Wi-Fi did not recover before SMTP retry");
+                    continue;
+                }
                 sent = body != NULL && smtp_client_send(&smtp, subject, body, error, sizeof(error));
             }
             if (!sent) {
@@ -372,27 +405,27 @@ static void notification_task(void *argument) {
             free(body);
         }
         memset(&smtp, 0, sizeof(smtp));
-        free(sms);
+        memset(&sms, 0, sizeof(sms));
     }
 }
 
 esp_err_t notification_service_start(void) {
-    g_notify_queue = xQueueCreate(NOTIFY_QUEUE_DEPTH, sizeof(sms_message_t *));
+    g_notify_queue = xQueueCreate(NOTIFY_QUEUE_DEPTH, sizeof(uint32_t));
     if (g_notify_queue == NULL) return ESP_ERR_NO_MEM;
-    return xTaskCreate(notification_task, "notify_task", 14336U, NULL, 6U, NULL) == pdPASS
+    return xTaskCreate(notification_task, "notify_task", 11264U, NULL, 6U, NULL) == pdPASS
         ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
-bool notification_service_enqueue_sms(const sms_message_t *sms) {
-    sms_message_t *copy;
-    if (sms == NULL || g_notify_queue == NULL) return false;
-    copy = malloc(sizeof(*copy));
-    if (copy == NULL) return false;
-    memcpy(copy, sms, sizeof(*copy));
-    if (xQueueSend(g_notify_queue, &copy, 0U) != pdTRUE) {
-        free(copy);
+bool notification_service_enqueue_inbox(uint32_t inbox_id) {
+    if (inbox_id == 0U || g_notify_queue == NULL) return false;
+    if (xQueueSend(g_notify_queue, &inbox_id, 0U) != pdTRUE) {
         ESP_LOGE(g_tag, "notification queue full; newest message rejected");
         return false;
     }
     return true;
+}
+
+bool notification_service_enqueue_test(void) {
+    const uint32_t test_id = 0U;
+    return g_notify_queue != NULL && xQueueSend(g_notify_queue, &test_id, 0U) == pdTRUE;
 }

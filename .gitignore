@@ -5,3 +5,4 @@ build/
 sdkconfig
 sdkconfig.old
 backups/
+log.*.txt

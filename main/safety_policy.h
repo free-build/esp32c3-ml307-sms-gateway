@@ -17,16 +17,8 @@ bool safety_is_forbidden_cellular_data_command(const char *command);
  */
 bool safety_is_pdp_deactivation_command(const char *command);
 
-/**
- * @brief 从 CGACT 查询结果提取所有活动 CID。
- * @param response 模组响应文本。
- * @param active 保存活动 CID 的数组。
- * @param capacity active 数组容量。
- * @param active_count 返回活动 CID 数量。
- * @return 响应至少包含一个格式正确的上下文时返回 true。
- */
-bool safety_parse_active_pdp_contexts(const char *response, int *active, size_t capacity,
-                                      size_t *active_count);
+/** @brief 判断指令是否仅删除一个合法的模组短信存储槽。 */
+bool safety_is_sms_delete_command(const char *command);
 
 /**
  * @brief 查询指定 CID 是否处于活动状态。
